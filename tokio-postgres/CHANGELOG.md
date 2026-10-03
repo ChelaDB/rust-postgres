@@ -1,5 +1,12 @@
 # Change Log
 
+## Unreleased
+
+### Added
+
+* Added `SimpleQueryStream::with_command_tags`, which reports each statement's command tag via the new `SimpleQueryMessage::CommandTag` variant and empty statements via the new `SimpleQueryMessage::EmptyQuery` variant.
+* Added `SimpleColumn::type_oid` and `SimpleColumn::type_modifier` methods.
+
 ## v0.7.18 - 2026-06-12
 
 ### Fixed
