@@ -24,6 +24,17 @@ impl BackendMessages {
     pub fn empty() -> BackendMessages {
         BackendMessages(BytesMut::new())
     }
+
+    /// Returns the transaction status byte of the `ReadyForQuery` message that ends this batch, if it ends with one.
+    ///
+    /// The decoder always ends a batch right after a `ReadyForQuery`, whose encoding is the fixed 6 bytes
+    /// `Z`, length 5 (big endian `i32`) and the status byte.
+    pub fn ready_for_query_status(&self) -> Option<u8> {
+        match &self.0[..] {
+            [.., backend::READY_FOR_QUERY_TAG, 0, 0, 0, 5, status] => Some(*status),
+            _ => None,
+        }
+    }
 }
 
 impl FallibleIterator for BackendMessages {

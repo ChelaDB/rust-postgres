@@ -16,6 +16,7 @@ use tokio_postgres::tls::{NoTls, NoTlsStream};
 use tokio_postgres::types::{Kind, Type};
 use tokio_postgres::{
     AsyncMessage, Client, Config, Connection, Error, IsolationLevel, SimpleQueryMessage,
+    TransactionStatus,
 };
 
 mod binary_copy;
@@ -1429,4 +1430,137 @@ async fn query_scalar() {
         .await
         .unwrap();
     assert_eq!(age, Some(20));
+}
+
+/// The transaction status once every request sent so far has finished.
+///
+/// A request failing with a database error resolves as soon as the error arrives, which can be just before its
+/// `ReadyForQuery` (the server flushes errors immediately), so the status may still be `Unknown` right after it.
+/// An empty query is allowed even in a failed transaction block and doesn't change the status.
+async fn settled_status(client: &Client) -> TransactionStatus {
+    client.batch_execute("").await.unwrap();
+    client.transaction_status()
+}
+
+#[tokio::test]
+async fn transaction_status_simple_query() {
+    let client = connect("user=postgres").await;
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+
+    client.batch_execute("BEGIN").await.unwrap();
+    assert_eq!(
+        client.transaction_status(),
+        TransactionStatus::InTransaction
+    );
+
+    client.batch_execute("SELECT 1/0").await.unwrap_err();
+    assert_eq!(settled_status(&client).await, TransactionStatus::Failed);
+
+    client.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+
+    // an error outside a transaction block leaves the connection idle
+    client.batch_execute("SELECT 1/0").await.unwrap_err();
+    assert_eq!(settled_status(&client).await, TransactionStatus::Idle);
+}
+
+#[tokio::test]
+async fn transaction_status_extended_query() {
+    let client = connect("user=postgres").await;
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+
+    client.execute("BEGIN", &[]).await.unwrap();
+    assert_eq!(
+        client.transaction_status(),
+        TransactionStatus::InTransaction
+    );
+
+    client.query("SELECT 1", &[]).await.unwrap();
+    assert_eq!(
+        client.transaction_status(),
+        TransactionStatus::InTransaction
+    );
+
+    client.query("SELECT 1/0", &[]).await.unwrap_err();
+    assert_eq!(settled_status(&client).await, TransactionStatus::Failed);
+
+    client.execute("ROLLBACK", &[]).await.unwrap();
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+}
+
+#[tokio::test]
+async fn transaction_status_transaction_object() {
+    let mut client = connect("user=postgres").await;
+
+    let transaction = client.transaction().await.unwrap();
+    assert_eq!(
+        transaction.client().transaction_status(),
+        TransactionStatus::InTransaction
+    );
+    transaction.query("SELECT 1", &[]).await.unwrap();
+    assert_eq!(
+        transaction.client().transaction_status(),
+        TransactionStatus::InTransaction
+    );
+    transaction.commit().await.unwrap();
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+
+    let transaction = client.transaction().await.unwrap();
+    transaction.query("SELECT 1/0", &[]).await.unwrap_err();
+    assert_eq!(
+        settled_status(transaction.client()).await,
+        TransactionStatus::Failed
+    );
+    transaction.rollback().await.unwrap();
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+}
+
+#[tokio::test]
+async fn transaction_status_dropped_request() {
+    let client = connect("user=postgres").await;
+
+    // dropped before its response arrives: the connection still finishes it in the background
+    let query = client.query("SELECT pg_sleep(0.5)", &[]);
+    assert!(
+        time::timeout(Duration::from_millis(100), query)
+            .await
+            .is_err()
+    );
+    assert_eq!(client.transaction_status(), TransactionStatus::Unknown);
+
+    client.query("SELECT 1", &[]).await.unwrap();
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+}
+
+#[tokio::test]
+async fn transaction_status_dropped_request_left_transaction_open() {
+    let client = connect("user=postgres").await;
+
+    let batch = client.batch_execute("BEGIN; SELECT pg_sleep(0.5)");
+    assert!(
+        time::timeout(Duration::from_millis(100), batch)
+            .await
+            .is_err()
+    );
+    assert_eq!(client.transaction_status(), TransactionStatus::Unknown);
+
+    client.batch_execute("SELECT 1").await.unwrap();
+    assert_eq!(
+        client.transaction_status(),
+        TransactionStatus::InTransaction
+    );
+
+    client.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+}
+
+#[tokio::test]
+async fn transaction_status_ignores_statement_close() {
+    let client = connect("user=postgres").await;
+
+    let statement = client.prepare("SELECT 1").await.unwrap();
+    client.query(&statement, &[]).await.unwrap();
+    // dropping a named statement closes it in the background, which can't change the status
+    drop(statement);
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
 }

@@ -1,3 +1,4 @@
+use crate::client::TransactionState;
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec};
 use crate::config::{self, Config};
 use crate::connect_tls::connect_tls;
@@ -17,6 +18,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
@@ -111,17 +113,25 @@ where
 
     startup(&mut stream, config, &user).await?;
     authenticate(&mut stream, config, &user).await?;
-    let (process_id, secret_key, parameters) = read_info(&mut stream).await?;
+    let (process_id, secret_key, parameters, status) = read_info(&mut stream).await?;
 
     let (sender, receiver) = mpsc::unbounded();
+    let transaction_state = Arc::new(TransactionState::new(status));
     let client = Client::new(
         sender,
         config.ssl_mode,
         config.ssl_negotiation,
         process_id,
         secret_key,
+        transaction_state.clone(),
     );
-    let connection = Connection::new(stream.inner, stream.delayed, parameters, receiver);
+    let connection = Connection::new(
+        stream.inner,
+        stream.delayed,
+        parameters,
+        receiver,
+        transaction_state,
+    );
 
     Ok((client, connection))
 }
@@ -335,7 +345,7 @@ where
 
 async fn read_info<S, T>(
     stream: &mut StartupStream<S, T>,
-) -> Result<(i32, i32, HashMap<String, String>), Error>
+) -> Result<(i32, i32, HashMap<String, String>, u8), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     T: AsyncRead + AsyncWrite + Unpin,
@@ -359,7 +369,9 @@ where
             Some(msg @ Message::NoticeResponse(_)) => {
                 stream.delayed.push_back(BackendMessage::Async(msg))
             }
-            Some(Message::ReadyForQuery(_)) => return Ok((process_id, secret_key, parameters)),
+            Some(Message::ReadyForQuery(body)) => {
+                return Ok((process_id, secret_key, parameters, body.status()));
+            }
             Some(Message::ErrorResponse(body)) => return Err(Error::db(body)),
             Some(_) => return Err(Error::unexpected_message()),
             None => return Err(Error::closed()),

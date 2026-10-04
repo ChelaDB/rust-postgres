@@ -1,3 +1,4 @@
+use crate::client::TransactionState;
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec};
 use crate::copy_in::CopyInReceiver;
 use crate::error::DbError;
@@ -13,6 +14,7 @@ use postgres_protocol::message::frontend;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
@@ -25,10 +27,13 @@ pub enum RequestMessages {
 pub struct Request {
     pub messages: RequestMessages,
     pub sender: mpsc::Sender<BackendMessages>,
+    /// Whether the request is counted as in flight for [`crate::Client::transaction_status`].
+    pub tracked: bool,
 }
 
 pub struct Response {
     sender: mpsc::Sender<BackendMessages>,
+    tracked: bool,
 }
 
 #[derive(PartialEq, Debug)]
@@ -54,6 +59,7 @@ pub struct Connection<S, T> {
     pending_responses: VecDeque<BackendMessage>,
     responses: VecDeque<Response>,
     state: State,
+    transaction_state: Arc<TransactionState>,
 }
 
 impl<S, T> Connection<S, T>
@@ -66,6 +72,7 @@ where
         pending_responses: VecDeque<BackendMessage>,
         parameters: HashMap<String, String>,
         receiver: mpsc::UnboundedReceiver<Request>,
+        transaction_state: Arc<TransactionState>,
     ) -> Connection<S, T> {
         Connection {
             stream,
@@ -75,6 +82,7 @@ where
             pending_responses,
             responses: VecDeque::new(),
             state: State::Active,
+            transaction_state,
         }
     }
 
@@ -145,12 +153,23 @@ where
 
             match response.sender.poll_ready(cx) {
                 Poll::Ready(Ok(())) => {
+                    // Record the status before handing the batch over, so that it is visible once the request
+                    // completes.
+                    if request_complete {
+                        self.transaction_state
+                            .request_complete(messages.ready_for_query_status(), response.tracked);
+                    }
                     let _ = response.sender.start_send(messages);
                     if !request_complete {
                         self.responses.push_front(response);
                     }
                 }
                 Poll::Ready(Err(_)) => {
+                    // The request's future was dropped; its status still counts.
+                    if request_complete {
+                        self.transaction_state
+                            .request_complete(messages.ready_for_query_status(), response.tracked);
+                    }
                     // we need to keep paging through the rest of the messages even if the receiver's hung up
                     if !request_complete {
                         self.responses.push_front(response);
@@ -184,6 +203,7 @@ where
                 trace!("polled new request");
                 self.responses.push_back(Response {
                     sender: request.sender,
+                    tracked: request.tracked,
                 });
                 Poll::Ready(Some(request.messages))
             }

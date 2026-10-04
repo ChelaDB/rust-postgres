@@ -33,6 +33,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll, ready};
 #[cfg(feature = "runtime")]
 use std::time::Duration;
@@ -90,15 +91,39 @@ pub struct InnerClient {
 
     /// A buffer to use when writing out postgres commands.
     buffer: Mutex<BytesMut>,
+
+    /// The transaction status shared with the connection.
+    transaction_state: Arc<TransactionState>,
 }
 
 impl InnerClient {
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
+        self.send_inner(messages, true)
+    }
+
+    /// Like `send`, but for requests that cannot change the transaction status (closing a statement or a portal),
+    /// which therefore don't make [`Client::transaction_status`] report `Unknown` while they are in flight.
+    pub fn send_status_neutral(&self, messages: RequestMessages) -> Result<Responses, Error> {
+        self.send_inner(messages, false)
+    }
+
+    fn send_inner(&self, messages: RequestMessages, tracked: bool) -> Result<Responses, Error> {
         let (sender, receiver) = mpsc::channel(1);
-        let request = Request { messages, sender };
-        self.sender
-            .unbounded_send(request)
-            .map_err(|_| Error::closed())?;
+        let request = Request {
+            messages,
+            sender,
+            tracked,
+        };
+        // Count the request before the connection can see it, so the count never drops below the true number.
+        if tracked {
+            self.transaction_state.request_sent();
+        }
+        if self.sender.unbounded_send(request).is_err() {
+            if tracked {
+                self.transaction_state.request_not_sent();
+            }
+            return Err(Error::closed());
+        }
 
         Ok(Responses {
             receiver,
@@ -188,6 +213,79 @@ pub struct Client {
     secret_key: i32,
 }
 
+/// The transaction status of a connection.
+///
+/// See [`Client::transaction_status`]. Anything other than `Idle` should be read as "may be inside a transaction
+/// block".
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransactionStatus {
+    /// Not in a transaction block.
+    Idle,
+    /// In a transaction block.
+    InTransaction,
+    /// In a failed transaction block. Statements are rejected until the block is ended.
+    Failed,
+    /// Not known: requests are still in flight, or the server reported a status this crate does not recognize.
+    Unknown,
+}
+
+impl TransactionStatus {
+    /// Maps the status byte of a `ReadyForQuery` message.
+    fn from_byte(status: u8) -> TransactionStatus {
+        match status {
+            b'I' => TransactionStatus::Idle,
+            b'T' => TransactionStatus::InTransaction,
+            b'E' => TransactionStatus::Failed,
+            _ => TransactionStatus::Unknown,
+        }
+    }
+}
+
+/// The transaction status state shared by a client and its connection.
+pub(crate) struct TransactionState {
+    /// The status byte of the most recent `ReadyForQuery` the connection routed.
+    status: AtomicU8,
+    /// The number of status-changing requests sent whose `ReadyForQuery` the connection hasn't routed yet.
+    in_flight: AtomicUsize,
+}
+
+impl TransactionState {
+    pub(crate) fn new(status: u8) -> TransactionState {
+        TransactionState {
+            status: AtomicU8::new(status),
+            in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn request_sent(&self) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn request_not_sent(&self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Called by the connection for every `ReadyForQuery` it routes, whether or not the request's receiver is still
+    /// alive, before the response is handed over.
+    pub(crate) fn request_complete(&self, status: Option<u8>, tracked: bool) {
+        if let Some(status) = status {
+            self.status.store(status, Ordering::Release);
+        }
+        // Decrement after storing the status, so a reader seeing the count reach zero also sees the status.
+        if tracked {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn get(&self) -> TransactionStatus {
+        if self.in_flight.load(Ordering::Acquire) > 0 {
+            return TransactionStatus::Unknown;
+        }
+        TransactionStatus::from_byte(self.status.load(Ordering::Acquire))
+    }
+}
+
 impl Client {
     pub(crate) fn new(
         sender: mpsc::UnboundedSender<Request>,
@@ -195,12 +293,14 @@ impl Client {
         ssl_negotiation: SslNegotiation,
         process_id: i32,
         secret_key: i32,
+        transaction_state: Arc<TransactionState>,
     ) -> Client {
         Client {
             inner: Arc::new(InnerClient {
                 sender,
                 cached_typeinfo: Default::default(),
                 buffer: Default::default(),
+                transaction_state,
             }),
             #[cfg(feature = "runtime")]
             socket_config: None,
@@ -209,6 +309,27 @@ impl Client {
             process_id,
             secret_key,
         }
+    }
+
+    /// Returns the transaction status of the connection.
+    ///
+    /// The status comes from the most recent `ReadyForQuery` message the connection received from the server, which
+    /// the server sends at the end of every request. The connection records it before handing the request's
+    /// response back, so once a request's future (or stream) has completed, this reflects the state after that
+    /// request.
+    ///
+    /// While any request sent through this client is still waiting for its `ReadyForQuery`, this returns
+    /// [`TransactionStatus::Unknown`]. That includes requests whose futures were dropped before completing: the
+    /// connection still drives them to completion in the background, and the status becomes known again once they
+    /// (and every request sent after them) have finished. A request that fails with a database error can resolve
+    /// just before its `ReadyForQuery` arrives, so the status can briefly be `Unknown` right after an error. Closing
+    /// statements and portals (done in the background when they are dropped) cannot change the status and is not
+    /// counted.
+    ///
+    /// An unrecognized status byte is also reported as [`TransactionStatus::Unknown`]. Callers should treat anything
+    /// other than [`TransactionStatus::Idle`] as "may be inside a transaction block".
+    pub fn transaction_status(&self) -> TransactionStatus {
+        self.inner.transaction_state.get()
     }
 
     pub(crate) fn inner(&self) -> &Arc<InnerClient> {
