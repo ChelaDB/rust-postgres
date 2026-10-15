@@ -323,6 +323,19 @@ impl fmt::Display for DbError {
 
 impl error::Error for DbError {}
 
+/// The cause of an authentication error when channel binding was required and the server
+/// authenticated without it (see `Error::is_channel_binding_refused`).
+#[derive(Debug)]
+struct ChannelBindingRefused;
+
+impl fmt::Display for ChannelBindingRefused {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.write_str("server did not use channel binding")
+    }
+}
+
+impl error::Error for ChannelBindingRefused {}
+
 /// Represents the position of an error in a query.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ErrorPosition {
@@ -352,8 +365,6 @@ enum Kind {
     Parse,
     Encode,
     Authentication,
-    /// Channel binding was required and the server authenticated without it.
-    ChannelBindingRefused,
     ConfigParse,
     Config,
     RowCount,
@@ -400,9 +411,6 @@ impl fmt::Display for Error {
             Kind::Parse => fmt.write_str("error parsing response from server"),
             Kind::Encode => fmt.write_str("error encoding message to server"),
             Kind::Authentication => fmt.write_str("authentication error"),
-            Kind::ChannelBindingRefused => {
-                fmt.write_str("authentication error: server did not use channel binding")
-            }
             Kind::ConfigParse => fmt.write_str("invalid connection string"),
             Kind::Config => fmt.write_str("invalid configuration"),
             Kind::RowCount => fmt.write_str("query returned an unexpected number of rows"),
@@ -470,7 +478,12 @@ impl Error {
     /// authenticated without it: trust (`AuthenticationOk` at once), cleartext or md5 password
     /// authentication, or SCRAM without `-PLUS`.
     pub fn is_channel_binding_refused(&self) -> bool {
-        self.0.kind == Kind::ChannelBindingRefused
+        self.0.kind == Kind::Authentication
+            && self
+                .0
+                .cause
+                .as_ref()
+                .is_some_and(|cause| cause.is::<ChannelBindingRefused>())
     }
 
     fn new(kind: Kind, cause: Option<Box<dyn error::Error + Sync + Send>>) -> Error {
@@ -488,7 +501,7 @@ impl Error {
     }
 
     pub(crate) fn channel_binding_refused() -> Error {
-        Error::new(Kind::ChannelBindingRefused, None)
+        Error::authentication(Box::new(ChannelBindingRefused))
     }
 
     pub(crate) fn closed() -> Error {
