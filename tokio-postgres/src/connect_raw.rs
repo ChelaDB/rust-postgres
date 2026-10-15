@@ -112,8 +112,10 @@ where
     };
 
     startup(&mut stream, config, &user).await?;
-    authenticate(&mut stream, config, &user).await?;
-    let (process_id, secret_key, parameters, status) = read_info(&mut stream).await?;
+    let sasl_verified = authenticate(&mut stream, config, &user).await?;
+    let (process_id, secret_key, parameters, status) = read_info(&mut stream)
+        .await
+        .map_err(|e| mark_sasl_verified(e, sasl_verified))?;
 
     let (sender, receiver) = mpsc::unbounded();
     let transaction_state = Arc::new(TransactionState::new(status));
@@ -166,19 +168,32 @@ where
         .map_err(Error::io)
 }
 
+/// Marks `e` as returned after a verified SCRAM final message when `sasl_verified`.
+fn mark_sasl_verified(e: Error, sasl_verified: bool) -> Error {
+    if sasl_verified {
+        e.after_sasl_verified()
+    } else {
+        e
+    }
+}
+
+/// Runs the authentication exchange. `Ok(true)` when it was SCRAM and the server's final
+/// message verified; every error returned after that point is marked
+/// (`Error::sasl_verified`).
 async fn authenticate<S, T>(
     stream: &mut StartupStream<S, T>,
     config: &Config,
     user: &str,
-) -> Result<(), Error>
+) -> Result<bool, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     T: TlsStream + Unpin,
 {
+    let mut sasl_verified = false;
     match stream.try_next().await.map_err(Error::io)? {
         Some(Message::AuthenticationOk) => {
             can_skip_channel_binding(config)?;
-            return Ok(());
+            return Ok(false);
         }
         Some(Message::AuthenticationCleartextPassword) => {
             can_skip_channel_binding(config)?;
@@ -203,6 +218,7 @@ where
         }
         Some(Message::AuthenticationSasl(body)) => {
             authenticate_sasl(stream, body, config).await?;
+            sasl_verified = true;
         }
         Some(Message::AuthenticationKerberosV5)
         | Some(Message::AuthenticationScmCredential)
@@ -217,20 +233,20 @@ where
         None => return Err(Error::closed()),
     }
 
-    match stream.try_next().await.map_err(Error::io)? {
-        Some(Message::AuthenticationOk) => Ok(()),
-        Some(Message::ErrorResponse(body)) => Err(Error::db(body)),
-        Some(_) => Err(Error::unexpected_message()),
-        None => Err(Error::closed()),
-    }
+    let result = match stream.try_next().await.map_err(Error::io) {
+        Ok(Some(Message::AuthenticationOk)) => Ok(sasl_verified),
+        Ok(Some(Message::ErrorResponse(body))) => Err(Error::db(body)),
+        Ok(Some(_)) => Err(Error::unexpected_message()),
+        Ok(None) => Err(Error::closed()),
+        Err(e) => Err(e),
+    };
+    result.map_err(|e| mark_sasl_verified(e, sasl_verified))
 }
 
 fn can_skip_channel_binding(config: &Config) -> Result<(), Error> {
     match config.channel_binding {
         config::ChannelBinding::Disable | config::ChannelBinding::Prefer => Ok(()),
-        config::ChannelBinding::Require => Err(Error::authentication(
-            "server did not use channel binding".into(),
-        )),
+        config::ChannelBinding::Require => Err(Error::channel_binding_refused()),
     }
 }
 

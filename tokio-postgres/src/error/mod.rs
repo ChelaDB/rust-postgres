@@ -352,6 +352,8 @@ enum Kind {
     Parse,
     Encode,
     Authentication,
+    /// Channel binding was required and the server authenticated without it.
+    ChannelBindingRefused,
     ConfigParse,
     Config,
     RowCount,
@@ -363,6 +365,8 @@ enum Kind {
 struct ErrorInner {
     kind: Kind,
     cause: Option<Box<dyn error::Error + Sync + Send>>,
+    /// The server's SCRAM final message verified before this error (see `Error::sasl_verified`).
+    sasl_verified: bool,
 }
 
 /// An error communicating with the Postgres server.
@@ -373,6 +377,7 @@ impl fmt::Debug for Error {
         fmt.debug_struct("Error")
             .field("kind", &self.0.kind)
             .field("cause", &self.0.cause)
+            .field("sasl_verified", &self.0.sasl_verified)
             .finish()
     }
 }
@@ -395,6 +400,9 @@ impl fmt::Display for Error {
             Kind::Parse => fmt.write_str("error parsing response from server"),
             Kind::Encode => fmt.write_str("error encoding message to server"),
             Kind::Authentication => fmt.write_str("authentication error"),
+            Kind::ChannelBindingRefused => {
+                fmt.write_str("authentication error: server did not use channel binding")
+            }
             Kind::ConfigParse => fmt.write_str("invalid connection string"),
             Kind::Config => fmt.write_str("invalid configuration"),
             Kind::RowCount => fmt.write_str("query returned an unexpected number of rows"),
@@ -436,8 +444,51 @@ impl Error {
         self.as_db_error().map(DbError::code)
     }
 
+    /// Whether the server proved it knows the password before this error: its SCRAM
+    /// (`SCRAM-SHA-256` or `SCRAM-SHA-256-PLUS`) final message arrived during the startup and its
+    /// server signature verified.
+    ///
+    /// True for every error the startup returns after that point (an `ErrorResponse` in place
+    /// of `AuthenticationOk` or later in the startup, a closed connection). A refusal then isn't
+    /// about the password: Postgres checks `clientcert=verify-full` after the password, and a
+    /// certificate whose name doesn't match the role reaches the client as `28P01`.
+    ///
+    /// False for everything else: a refused proof (a wrong password), a final message whose
+    /// signature doesn't verify, md5 or cleartext authentication, an error before
+    /// authentication, a TLS failure, and errors on an open connection.
+    pub fn sasl_verified(&self) -> bool {
+        self.0.sasl_verified
+    }
+
+    /// Whether the error came from setting up TLS: the TLS connector failed (its error is the
+    /// `source`), or the server refused TLS that the configuration requires.
+    pub fn is_tls(&self) -> bool {
+        self.0.kind == Kind::Tls
+    }
+
+    /// Whether channel binding was required (`channel_binding=require`) and the server
+    /// authenticated without it: trust (`AuthenticationOk` at once), cleartext or md5 password
+    /// authentication, or SCRAM without `-PLUS`.
+    pub fn is_channel_binding_refused(&self) -> bool {
+        self.0.kind == Kind::ChannelBindingRefused
+    }
+
     fn new(kind: Kind, cause: Option<Box<dyn error::Error + Sync + Send>>) -> Error {
-        Error(Box::new(ErrorInner { kind, cause }))
+        Error(Box::new(ErrorInner {
+            kind,
+            cause,
+            sasl_verified: false,
+        }))
+    }
+
+    /// Marks an error the startup returns after a verified SCRAM final message.
+    pub(crate) fn after_sasl_verified(mut self) -> Error {
+        self.0.sasl_verified = true;
+        self
+    }
+
+    pub(crate) fn channel_binding_refused() -> Error {
+        Error::new(Kind::ChannelBindingRefused, None)
     }
 
     pub(crate) fn closed() -> Error {
