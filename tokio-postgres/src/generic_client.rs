@@ -10,6 +10,9 @@ mod private {
 /// A trait allowing abstraction over connections and transactions.
 ///
 /// This trait is "sealed", and cannot be implemented outside of this crate.
+// `async_trait` marks each method `#[must_use]` on top of the boxed future it returns, which
+// is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait GenericClient: private::Sealed {
     /// Like [`Client::execute`].
