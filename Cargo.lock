@@ -1893,6 +1893,7 @@ name = "tokio-postgres"
 version = "0.7.18"
 dependencies = [
  "async-trait",
+ "base64",
  "bit-vec 0.6.3",
  "bit-vec 0.7.0",
  "bit-vec 0.8.0",
@@ -1909,6 +1910,7 @@ dependencies = [
  "futures-util",
  "geo-types 0.6.2",
  "geo-types 0.7.19",
+ "hmac",
  "jiff 0.1.29",
  "jiff 0.2.28",
  "log",
@@ -1920,6 +1922,7 @@ dependencies = [
  "postgres-types",
  "rand",
  "serde_json",
+ "sha2",
  "smol_str",
  "socket2",
  "time 0.2.27",
