@@ -88,6 +88,14 @@ pub enum LoadBalanceHosts {
     Random,
 }
 
+/// Replication mode configuration.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReplicationMode {
+    /// Logical replication (`replication=database`).
+    Logical,
+}
+
 /// A host specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Host {
@@ -330,6 +338,12 @@ impl Config {
     /// Sets the value of the `application_name` runtime parameter.
     pub fn application_name(&mut self, application_name: impl Into<String>) -> &mut Config {
         self.application_name = Some(application_name.into());
+        self
+    }
+
+    /// Sets the replication mode (t2 RED: declaration only, not implemented yet).
+    pub fn replication_mode(&mut self, replication_mode: ReplicationMode) -> &mut Config {
+        let _ = replication_mode;
         self
     }
 

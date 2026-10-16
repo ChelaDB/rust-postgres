@@ -8,3 +8,12 @@ services:
       - ./docker/sql_setup.sh:/docker-entrypoint-initdb.d/sql_setup.sh
     environment:
       POSTGRES_PASSWORD: postgres
+  # The logical replication tests (tokio-postgres/tests/replication_live.rs) only: a separate
+  # server, so `wal_level = logical` stays out of the main test server's configuration.
+  postgres-replication:
+    image: docker.io/postgres:18
+    command: ["postgres", "-c", "wal_level=logical"]
+    ports:
+      - 5434:5432
+    environment:
+      POSTGRES_PASSWORD: postgres

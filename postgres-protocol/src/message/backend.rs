@@ -32,6 +32,11 @@ pub const PARAMETER_STATUS_TAG: u8 = b'S';
 pub const PARAMETER_DESCRIPTION_TAG: u8 = b't';
 pub const ROW_DESCRIPTION_TAG: u8 = b'T';
 pub const READY_FOR_QUERY_TAG: u8 = b'Z';
+pub const COPY_BOTH_RESPONSE_TAG: u8 = b'W';
+
+// Replication message tags (inside CopyData).
+pub const XLOG_DATA_TAG: u8 = b'w';
+pub const PRIMARY_KEEPALIVE_TAG: u8 = b'k';
 
 #[derive(Debug, Copy, Clone)]
 pub struct Header {
@@ -93,6 +98,7 @@ pub enum Message {
     CopyDone,
     CopyInResponse(CopyInResponseBody),
     CopyOutResponse(CopyOutResponseBody),
+    CopyBothResponse(CopyBothResponseBody),
     DataRow(DataRowBody),
     EmptyQueryResponse,
     ErrorResponse(ErrorResponseBody),
@@ -521,6 +527,100 @@ impl CopyOutResponseBody {
             remaining: self.len,
             buf: &self.storage,
         }
+    }
+}
+
+// t2 RED: declarations only; the coder implements parsing.
+pub struct CopyBothResponseBody {
+    format: u8,
+    len: u16,
+    storage: Bytes,
+}
+
+impl CopyBothResponseBody {
+    #[inline]
+    pub fn format(&self) -> u8 {
+        self.format
+    }
+
+    #[inline]
+    pub fn column_formats(&self) -> ColumnFormats<'_> {
+        ColumnFormats {
+            remaining: self.len,
+            buf: &self.storage,
+        }
+    }
+}
+
+/// A replication message carried in a CopyData message of a CopyBoth stream.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum ReplicationMessage<D> {
+    XLogData(XLogDataBody<D>),
+    PrimaryKeepAlive(PrimaryKeepAliveBody),
+}
+
+impl ReplicationMessage<Bytes> {
+    // t2 RED: not implemented yet.
+    pub fn parse(buf: &Bytes) -> io::Result<Self> {
+        let _ = buf;
+        Err(io::Error::other(
+            "ReplicationMessage::parse is not implemented",
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct XLogDataBody<D> {
+    wal_start: u64,
+    wal_end: u64,
+    timestamp: std::time::SystemTime,
+    data: D,
+}
+
+impl<D> XLogDataBody<D> {
+    #[inline]
+    pub fn wal_start(&self) -> u64 {
+        self.wal_start
+    }
+
+    #[inline]
+    pub fn wal_end(&self) -> u64 {
+        self.wal_end
+    }
+
+    #[inline]
+    pub fn timestamp(&self) -> std::time::SystemTime {
+        self.timestamp
+    }
+
+    #[inline]
+    pub fn data(&self) -> &D {
+        &self.data
+    }
+}
+
+#[derive(Debug)]
+pub struct PrimaryKeepAliveBody {
+    wal_end: u64,
+    timestamp: std::time::SystemTime,
+    reply: u8,
+}
+
+impl PrimaryKeepAliveBody {
+    #[inline]
+    pub fn wal_end(&self) -> u64 {
+        self.wal_end
+    }
+
+    #[inline]
+    pub fn timestamp(&self) -> std::time::SystemTime {
+        self.timestamp
+    }
+
+    #[inline]
+    pub fn reply(&self) -> u8 {
+        self.reply
     }
 }
 

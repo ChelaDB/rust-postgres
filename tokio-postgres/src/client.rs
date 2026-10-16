@@ -757,6 +757,16 @@ impl Client {
         copy_in::copy_in(self.inner(), statement).await
     }
 
+    /// Executes a query that starts a CopyBoth exchange (`START_REPLICATION`) with the simple
+    /// query protocol (t2 RED: declaration only, not implemented yet).
+    pub async fn copy_both_simple<T>(&self, query: &str) -> Result<crate::CopyBothDuplex<T>, Error>
+    where
+        T: Buf + 'static + Send,
+    {
+        let _ = query;
+        Err(Error::closed())
+    }
+
     /// Executes a `COPY TO STDOUT` statement, returning a stream of the resulting data.
     ///
     /// PostgreSQL does not support parameters in `COPY` statements, so this method does not take any.
