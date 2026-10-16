@@ -9,7 +9,9 @@ use crate::copy_both::CopyBothDuplex;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::{SinkExt, Stream};
 use pin_project_lite::pin_project;
-use postgres_protocol::message::backend::ReplicationMessage;
+pub use postgres_protocol::message::backend::{
+    PrimaryKeepAliveBody, ReplicationMessage, XLogDataBody,
+};
 use postgres_types::PgLsn;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
@@ -35,20 +37,26 @@ fn pg_timestamp(time: SystemTime) -> i64 {
 pin_project! {
     /// Parses the replication messages of a CopyBoth stream and sends standby status updates.
     ///
-    /// The stream ends when the server ends the copy and after the copy's first error; a
-    /// message it cannot parse is an error of its own, and the stream goes on after it. End the
-    /// replication with `finish`.
+    /// The stream ends when the server ends the copy and after its first error, a message it
+    /// cannot parse included: a consumer that read on past a lost message could confirm
+    /// positions beyond it, and the slot would never send it again. End the replication with
+    /// `finish` (or drop the stream, which ends the copy) and restart from the last confirmed
+    /// position.
     #[project(!Unpin)]
     pub struct ReplicationStream {
         #[pin]
         stream: CopyBothDuplex<Bytes>,
+        failed: bool,
     }
 }
 
 impl ReplicationStream {
     /// Wraps the CopyBoth stream `START_REPLICATION` opened.
     pub fn new(stream: CopyBothDuplex<Bytes>) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            failed: false,
+        }
     }
 
     /// Sends a standby status update (`r`): the positions written, flushed and applied, the
@@ -85,9 +93,15 @@ impl Stream for ReplicationStream {
     type Item = Result<ReplicationMessage<Bytes>, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match ready!(self.project().stream.poll_next(cx)) {
+        let this = self.project();
+        if *this.failed {
+            return Poll::Ready(None);
+        }
+        match ready!(this.stream.poll_next(cx)) {
             Some(Ok(buf)) => {
-                Poll::Ready(Some(ReplicationMessage::parse(&buf).map_err(Error::parse)))
+                let message = ReplicationMessage::parse(&buf).map_err(Error::parse);
+                *this.failed = message.is_err();
+                Poll::Ready(Some(message))
             }
             Some(Err(err)) => Poll::Ready(Some(Err(err))),
             None => Poll::Ready(None),

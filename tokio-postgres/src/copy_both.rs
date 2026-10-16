@@ -273,17 +273,47 @@ where
     let started = Arc::new(AtomicBool::new(false));
     let receiver = CopyBothReceiver::new(receiver, started.clone());
     let mut responses = client.send(RequestMessages::CopyBoth(receiver))?;
+    let guard = StartGuard {
+        started,
+        armed: true,
+    };
 
     sender
         .send(CopyBothMessage::Message(FrontendMessage::Raw(buf)))
         .await
         .map_err(|_| Error::closed())?;
 
-    match responses.next().await? {
+    let answer = responses.next().await;
+    guard.settle(matches!(answer, Ok(Message::CopyBothResponse(_))));
+    match answer? {
         Message::CopyBothResponse(_) => {}
         _ => return Err(Error::unexpected_message()),
     }
-    started.store(true, Ordering::Release);
 
     Ok(CopyBothDuplex::new(sender, responses))
+}
+
+/// Marks the copy started once the server's answer says so, and also when `copy_both_simple`
+/// is dropped before the answer arrives: the server may start the copy anyway, so the
+/// receiver must end it with a `CopyDone` rather than let the next request run into it. A
+/// server that refused ignores that `CopyDone` (PostgreSQL accepts and ignores copy messages
+/// outside a copy), and one whose refusal the connection has already completed never gets it.
+struct StartGuard {
+    started: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl StartGuard {
+    fn settle(mut self, started: bool) {
+        self.armed = false;
+        self.started.store(started, Ordering::Release);
+    }
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.started.store(true, Ordering::Release);
+        }
+    }
 }

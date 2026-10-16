@@ -295,6 +295,76 @@ async fn after_finish_the_duplex_is_closed() {
     finish_script(server).await;
 }
 
+// A message the client cannot parse ends the replication stream (fail closed): a consumer
+// that went on reading could confirm positions past a message it never received. Dropping
+// the stream then ends the copy, and the connection runs the next command.
+#[tokio::test]
+async fn a_parse_error_ends_the_replication_stream() {
+    let (client, server) = connected(|mut s| async move {
+        s.accept().await;
+        s.start_copy_both().await;
+        s.send(b'd', b"x-not-a-replication-message").await;
+        s.xlog_data(b"after the bad message").await;
+        let (tag, _) = s.read_msg().await;
+        assert_eq!(tag, b'c', "CopyDone (got tag {:?})", tag as char);
+        s.send(b'c', &[]).await;
+        s.command_complete("START_REPLICATION").await;
+        s.ready().await;
+        s.answer_query("IDENTIFY_SYSTEM").await;
+    })
+    .await;
+    let mut stream = Box::pin(ReplicationStream::new(
+        client
+            .copy_both_simple::<Bytes>(START)
+            .await
+            .expect("the copy starts"),
+    ));
+    assert!(matches!(
+        timeout(PATIENCE, stream.next()).await.unwrap(),
+        Some(Err(_))
+    ));
+    assert!(
+        timeout(PATIENCE, stream.next()).await.unwrap().is_none(),
+        "the stream ends after a parse error"
+    );
+    drop(stream);
+    identify(&client).await;
+    drop(client);
+    finish_script(server).await;
+}
+
+// `copy_both_simple` dropped while it waits for the server's answer: the server may start the
+// copy anyway, so the client ends it with a CopyDone (which a server that refused ignores),
+// and the connection runs the next command instead of sending it into a running copy.
+#[tokio::test]
+async fn dropping_copy_both_simple_before_the_answer_ends_the_copy() {
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
+    let (client, server) = connected(|mut s| async move {
+        s.accept().await;
+        assert_eq!(s.query().await, START);
+        answer_rx.await.unwrap();
+        s.send(b'W', &[0, 0, 0]).await;
+        s.xlog_data(b"unread").await;
+        let (tag, _) = s.read_msg().await;
+        assert_eq!(tag, b'c', "CopyDone (got tag {:?})", tag as char);
+        s.send(b'c', &[]).await;
+        s.command_complete("START_REPLICATION").await;
+        s.ready().await;
+        s.answer_query("IDENTIFY_SYSTEM").await;
+    })
+    .await;
+    assert!(
+        timeout(SETTLE, client.copy_both_simple::<Bytes>(START))
+            .await
+            .is_err(),
+        "the server has not answered yet"
+    );
+    answer_tx.send(()).unwrap();
+    identify(&client).await;
+    drop(client);
+    finish_script(server).await;
+}
+
 #[test]
 fn connection_strings_set_or_refuse_replication() {
     let config: Config = "postgresql://u@h/app?replication=database".parse().unwrap();
