@@ -174,6 +174,9 @@ pub enum Host {
 /// * `channel_binding` - Controls usage of channel binding in the authentication process. If set to `disable`, channel
 ///     binding will not be used. If set to `prefer`, channel binding will be used if available, but not used otherwise.
 ///     If set to `require`, the authentication process will fail if channel binding is not used. Defaults to `prefer`.
+/// * `replication` - Starts a replication connection. `database` starts a logical replication connection to the
+///     database `dbname`; `off`, `false`, `no` and `0` start an ordinary connection (the default). Physical
+///     replication (`true`) is not supported.
 /// * `load_balance_hosts` - Controls the order in which the client tries to connect to the available hosts and
 ///     addresses. Once a connection attempt is successful no other hosts and addresses will be tried. This parameter
 ///     is typically used in combination with multiple host names or a DNS record that returns multiple IPs. If set to
@@ -243,6 +246,7 @@ pub struct Config {
     pub(crate) target_session_attrs: TargetSessionAttrs,
     pub(crate) channel_binding: ChannelBinding,
     pub(crate) load_balance_hosts: LoadBalanceHosts,
+    pub(crate) replication_mode: Option<ReplicationMode>,
 }
 
 impl Default for Config {
@@ -277,6 +281,7 @@ impl Config {
             target_session_attrs: TargetSessionAttrs::Any,
             channel_binding: ChannelBinding::Prefer,
             load_balance_hosts: LoadBalanceHosts::Disable,
+            replication_mode: None,
         }
     }
 
@@ -341,10 +346,18 @@ impl Config {
         self
     }
 
-    /// Sets the replication mode (t2 RED: declaration only, not implemented yet).
+    /// Sets the replication mode: the startup packet then carries `replication=database`
+    /// ([`ReplicationMode::Logical`]), which makes the server start a walsender that accepts
+    /// replication commands (`IDENTIFY_SYSTEM`, `CREATE_REPLICATION_SLOT`, `START_REPLICATION`)
+    /// as simple queries.
     pub fn replication_mode(&mut self, replication_mode: ReplicationMode) -> &mut Config {
-        let _ = replication_mode;
+        self.replication_mode = Some(replication_mode);
         self
+    }
+
+    /// Gets the replication mode, if one has been set with the `replication_mode` method.
+    pub fn get_replication_mode(&self) -> Option<ReplicationMode> {
+        self.replication_mode
     }
 
     /// Gets the value of the `application_name` runtime parameter, if it has
@@ -726,6 +739,15 @@ impl Config {
                 };
                 self.load_balance_hosts(load_balance_hosts);
             }
+            "replication" => match value {
+                "database" => {
+                    self.replication_mode(ReplicationMode::Logical);
+                }
+                "off" | "false" | "no" | "0" => self.replication_mode = None,
+                _ => {
+                    return Err(Error::config_parse(Box::new(InvalidValue("replication"))));
+                }
+            },
             key => {
                 return Err(Error::config_parse(Box::new(UnknownOption(
                     key.to_string(),
@@ -811,6 +833,7 @@ impl fmt::Debug for Config {
             .field("target_session_attrs", &self.target_session_attrs)
             .field("channel_binding", &self.channel_binding)
             .field("load_balance_hosts", &self.load_balance_hosts)
+            .field("replication", &self.replication_mode)
             .finish()
     }
 }

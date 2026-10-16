@@ -196,6 +196,16 @@ impl Message {
                     storage,
                 })
             }
+            COPY_BOTH_RESPONSE_TAG => {
+                let format = buf.read_u8()?;
+                let len = buf.read_u16::<BigEndian>()?;
+                let storage = buf.read_all();
+                Message::CopyBothResponse(CopyBothResponseBody {
+                    format,
+                    len,
+                    storage,
+                })
+            }
             EMPTY_QUERY_RESPONSE_TAG => Message::EmptyQueryResponse,
             BACKEND_KEY_DATA_TAG => {
                 let process_id = buf.read_i32::<BigEndian>()?;
@@ -530,7 +540,8 @@ impl CopyOutResponseBody {
     }
 }
 
-// t2 RED: declarations only; the coder implements parsing.
+/// The body of a CopyBothResponse (`W`), which a walsender sends when `START_REPLICATION`
+/// starts streaming.
 pub struct CopyBothResponseBody {
     format: u8,
     len: u16,
@@ -560,13 +571,75 @@ pub enum ReplicationMessage<D> {
     PrimaryKeepAlive(PrimaryKeepAliveBody),
 }
 
+/// Seconds from the Unix epoch to 2000-01-01 00:00:00 UTC, the epoch of the replication
+/// protocol's timestamps.
+const PG_EPOCH_UNIX_SECS: u64 = 946_684_800;
+
+/// The length of an XLogData header: tag, `wal_start`, `wal_end`, timestamp.
+const XLOG_DATA_HEADER_LEN: usize = 1 + 8 + 8 + 8;
+/// The length of a primary keepalive: tag, `wal_end`, timestamp, reply.
+const PRIMARY_KEEPALIVE_LEN: usize = 1 + 8 + 8 + 1;
+
+/// Converts a replication protocol timestamp (microseconds since 2000-01-01 UTC, possibly
+/// negative) into a `SystemTime`; a value this platform cannot represent is an error.
+fn pg_timestamp(micros: i64) -> io::Result<std::time::SystemTime> {
+    let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_secs(PG_EPOCH_UNIX_SECS);
+    let offset = std::time::Duration::from_micros(micros.unsigned_abs());
+    let time = if micros >= 0 {
+        epoch.checked_add(offset)
+    } else {
+        epoch.checked_sub(offset)
+    };
+    time.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("replication timestamp {micros} is out of range"),
+        )
+    })
+}
+
 impl ReplicationMessage<Bytes> {
-    // t2 RED: not implemented yet.
+    /// Parses the payload of one CopyData message of a replication stream.
+    ///
+    /// An XLogData's `data` is the rest of the message, byte for byte (a slice of `buf`).
     pub fn parse(buf: &Bytes) -> io::Result<Self> {
-        let _ = buf;
-        Err(io::Error::other(
-            "ReplicationMessage::parse is not implemented",
-        ))
+        let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidInput, what.to_string());
+        let Some(&tag) = buf.first() else {
+            return Err(invalid("empty replication message"));
+        };
+        match tag {
+            XLOG_DATA_TAG => {
+                if buf.len() < XLOG_DATA_HEADER_LEN {
+                    return Err(invalid("XLogData message shorter than its header"));
+                }
+                let wal_start = BigEndian::read_u64(&buf[1..9]);
+                let wal_end = BigEndian::read_u64(&buf[9..17]);
+                let timestamp = pg_timestamp(BigEndian::read_i64(&buf[17..25]))?;
+                Ok(ReplicationMessage::XLogData(XLogDataBody {
+                    wal_start,
+                    wal_end,
+                    timestamp,
+                    data: buf.slice(XLOG_DATA_HEADER_LEN..),
+                }))
+            }
+            PRIMARY_KEEPALIVE_TAG => {
+                if buf.len() != PRIMARY_KEEPALIVE_LEN {
+                    return Err(invalid("primary keepalive message of the wrong length"));
+                }
+                let wal_end = BigEndian::read_u64(&buf[1..9]);
+                let timestamp = pg_timestamp(BigEndian::read_i64(&buf[9..17]))?;
+                let reply = buf[17];
+                Ok(ReplicationMessage::PrimaryKeepAlive(PrimaryKeepAliveBody {
+                    wal_end,
+                    timestamp,
+                    reply,
+                }))
+            }
+            tag => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown replication message tag `{tag}`"),
+            )),
+        }
     }
 }
 

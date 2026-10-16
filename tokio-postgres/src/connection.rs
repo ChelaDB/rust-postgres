@@ -1,5 +1,6 @@
 use crate::client::TransactionState;
 use crate::codec::{BackendMessage, BackendMessages, FrontendMessage, PostgresCodec};
+use crate::copy_both::CopyBothReceiver;
 use crate::copy_in::CopyInReceiver;
 use crate::error::DbError;
 use crate::maybe_tls_stream::MaybeTlsStream;
@@ -22,6 +23,7 @@ use tokio_util::codec::Framed;
 pub enum RequestMessages {
     Single(FrontendMessage),
     CopyIn(CopyInReceiver),
+    CopyBoth(CopyBothReceiver),
 }
 
 pub struct Request {
@@ -185,6 +187,18 @@ where
                     return Ok(None);
                 }
             }
+
+            // A CopyBoth request blocks the requests after it, so when the last response
+            // completes while one is being written, it is that request's: the server has left
+            // the copy (an error, or the end of the command), and anything the client would
+            // still send for it (CopyData, CopyDone) would arrive as a stray message.
+            if request_complete
+                && self.responses.is_empty()
+                && matches!(self.pending_request, Some(RequestMessages::CopyBoth(_)))
+            {
+                trace!("poll_read: copy_both request completed by the server");
+                self.pending_request = None;
+            }
         }
     }
 
@@ -277,6 +291,24 @@ where
                         .start_send(message)
                         .map_err(Error::io)?;
                     self.pending_request = Some(RequestMessages::CopyIn(receiver));
+                }
+                RequestMessages::CopyBoth(mut receiver) => {
+                    let message = match receiver.poll_next_unpin(cx) {
+                        Poll::Ready(Some(message)) => message,
+                        Poll::Ready(None) => {
+                            trace!("poll_write: finished copy_both request");
+                            continue;
+                        }
+                        Poll::Pending => {
+                            trace!("poll_write: waiting on copy_both stream");
+                            self.pending_request = Some(RequestMessages::CopyBoth(receiver));
+                            return Ok(true);
+                        }
+                    };
+                    Pin::new(&mut self.stream)
+                        .start_send(message)
+                        .map_err(Error::io)?;
+                    self.pending_request = Some(RequestMessages::CopyBoth(receiver));
                 }
             }
         }

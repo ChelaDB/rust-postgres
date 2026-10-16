@@ -758,13 +758,18 @@ impl Client {
     }
 
     /// Executes a query that starts a CopyBoth exchange (`START_REPLICATION`) with the simple
-    /// query protocol (t2 RED: declaration only, not implemented yet).
+    /// query protocol, on a replication connection (see [`Config::replication_mode`]).
+    ///
+    /// The query's error (a refused `START_REPLICATION`) is returned and leaves the connection
+    /// usable. Wrap the duplex in [`crate::replication::ReplicationStream`] to parse the
+    /// replication messages.
+    ///
+    /// [`Config::replication_mode`]: crate::Config::replication_mode
     pub async fn copy_both_simple<T>(&self, query: &str) -> Result<crate::CopyBothDuplex<T>, Error>
     where
         T: Buf + 'static + Send,
     {
-        let _ = query;
-        Err(Error::closed())
+        crate::copy_both::copy_both_simple(self.inner(), query).await
     }
 
     /// Executes a `COPY TO STDOUT` statement, returning a stream of the resulting data.
