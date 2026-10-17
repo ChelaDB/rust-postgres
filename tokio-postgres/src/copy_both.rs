@@ -38,14 +38,24 @@ pub struct CopyBothReceiver {
     /// Set once the server has started the copy (CopyBothResponse); only then does dropping the
     /// duplex end the copy with a `CopyDone`.
     started: Arc<AtomicBool>,
+    /// Set by the duplex once the server has left the copy (an error, or a `CommandComplete`
+    /// without a `CopyDone` of its own, as a walsender sends when it shuts down): from then on
+    /// nothing more is sent for the copy, not even a `CopyDone`, even while the connection still
+    /// waits for the `ReadyForQuery` that completes the request.
+    left: Arc<AtomicBool>,
     done: bool,
 }
 
 impl CopyBothReceiver {
-    fn new(receiver: mpsc::Receiver<CopyBothMessage>, started: Arc<AtomicBool>) -> Self {
+    fn new(
+        receiver: mpsc::Receiver<CopyBothMessage>,
+        started: Arc<AtomicBool>,
+        left: Arc<AtomicBool>,
+    ) -> Self {
         CopyBothReceiver {
             receiver,
             started,
+            left,
             done: false,
         }
     }
@@ -62,6 +72,10 @@ impl Stream for CopyBothReceiver {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<FrontendMessage>> {
         if self.done {
+            return Poll::Ready(None);
+        }
+        if self.left.load(Ordering::Acquire) {
+            self.done = true;
             return Poll::Ready(None);
         }
 
@@ -96,7 +110,9 @@ pin_project! {
     /// The two halves of a CopyBoth exchange: a `Stream` of the server's CopyData payloads and a
     /// `Sink` of the client's, each item one CopyData message.
     ///
-    /// The stream ends when the server ends the copy (`CopyDone`) and after the first error. End
+    /// The stream ends when the server ends the copy (`CopyDone`, or a `CommandComplete` without
+    /// one, as a walsender sends when it shuts down) and after the first error; once the server
+    /// has left the copy, nothing more is sent for it. End
     /// the copy with `finish` (or `Sink::close`); dropping the duplex of a running copy also ends
     /// it with a `CopyDone`, and the connection discards the rest of the server's answer.
     #[project(!Unpin)]
@@ -106,6 +122,7 @@ pin_project! {
         responses: Responses,
         state: SinkState,
         stream_done: bool,
+        left: Arc<AtomicBool>,
         #[pin]
         _p: PhantomPinned,
         _p2: PhantomData<T>,
@@ -116,12 +133,17 @@ impl<T> CopyBothDuplex<T>
 where
     T: Buf + 'static + Send,
 {
-    fn new(sender: mpsc::Sender<CopyBothMessage>, responses: Responses) -> Self {
+    fn new(
+        sender: mpsc::Sender<CopyBothMessage>,
+        responses: Responses,
+        left: Arc<AtomicBool>,
+    ) -> Self {
         CopyBothDuplex {
             sender,
             responses,
             state: SinkState::Active,
             stream_done: false,
+            left,
             _p: PhantomPinned,
             _p2: PhantomData,
         }
@@ -152,6 +174,7 @@ where
                     let message = match ready!(this.responses.poll_next(cx)) {
                         Ok(message) => message,
                         Err(e) => {
+                            this.left.store(true, Ordering::Release);
                             *this.state = SinkState::Finished;
                             *this.stream_done = true;
                             return Poll::Ready(Err(e));
@@ -168,6 +191,7 @@ where
                             return Poll::Ready(Ok(rows));
                         }
                         _ => {
+                            this.left.store(true, Ordering::Release);
                             *this.state = SinkState::Finished;
                             *this.stream_done = true;
                             return Poll::Ready(Err(Error::unexpected_message()));
@@ -202,6 +226,8 @@ impl<T> Stream for CopyBothDuplex<T> {
         let message = match ready!(this.responses.poll_next(cx)) {
             Ok(message) => message,
             Err(e) => {
+                // The server's error ends the copy on its side: nothing more goes out for it.
+                this.left.store(true, Ordering::Release);
                 *this.stream_done = true;
                 return Poll::Ready(Some(Err(e)));
             }
@@ -212,7 +238,16 @@ impl<T> Stream for CopyBothDuplex<T> {
                 *this.stream_done = true;
                 Poll::Ready(None)
             }
+            Message::CommandComplete(_) => {
+                // A walsender that shuts down completes the command without a CopyDone of its
+                // own: the copy has ended cleanly, and the server no longer reads copy messages.
+                this.left.store(true, Ordering::Release);
+                *this.stream_done = true;
+                *this.state = SinkState::Finished;
+                Poll::Ready(None)
+            }
             _ => {
+                this.left.store(true, Ordering::Release);
                 *this.stream_done = true;
                 Poll::Ready(Some(Err(Error::unexpected_message())))
             }
@@ -235,7 +270,7 @@ where
 
     fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Error> {
         let this = self.project();
-        if !matches!(this.state, SinkState::Active) {
+        if !matches!(this.state, SinkState::Active) || this.left.load(Ordering::Acquire) {
             return Err(Error::closed());
         }
         // One CopyData per item: a walsender reads one standby message per CopyData.
@@ -271,7 +306,8 @@ where
 
     let (mut sender, receiver) = mpsc::channel(1);
     let started = Arc::new(AtomicBool::new(false));
-    let receiver = CopyBothReceiver::new(receiver, started.clone());
+    let left = Arc::new(AtomicBool::new(false));
+    let receiver = CopyBothReceiver::new(receiver, started.clone(), left.clone());
     let mut responses = client.send(RequestMessages::CopyBoth(receiver))?;
     let guard = StartGuard {
         started,
@@ -290,7 +326,7 @@ where
         _ => return Err(Error::unexpected_message()),
     }
 
-    Ok(CopyBothDuplex::new(sender, responses))
+    Ok(CopyBothDuplex::new(sender, responses, left))
 }
 
 /// Marks the copy started once the server's answer says so, and also when `copy_both_simple`
