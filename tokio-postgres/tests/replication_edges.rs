@@ -365,6 +365,129 @@ async fn dropping_copy_both_simple_before_the_answer_ends_the_copy() {
     finish_script(server).await;
 }
 
+// A walsender that shuts down (smart or fast shutdown, `pg_terminate_backend` aside) ends the
+// copy with CommandComplete and ReadyForQuery, without a CopyDone of its own: that is the end of
+// the copy, not an unexpected message. The stream ends cleanly (`None`), and the connection runs
+// the next command.
+#[tokio::test]
+async fn a_command_complete_inside_the_copy_is_a_clean_end() {
+    let (client, server) = connected(|mut s| async move {
+        s.accept().await;
+        s.start_copy_both().await;
+        s.xlog_data(b"last").await;
+        s.command_complete("START_REPLICATION").await;
+        s.ready().await;
+        s.answer_query("IDENTIFY_SYSTEM").await;
+    })
+    .await;
+    let mut duplex = Box::pin(
+        client
+            .copy_both_simple::<Bytes>(START)
+            .await
+            .expect("the copy starts"),
+    );
+    let first = timeout(PATIENCE, duplex.next()).await.unwrap();
+    assert!(matches!(first, Some(Ok(_))), "{first:?}");
+    let end = timeout(PATIENCE, duplex.next()).await.unwrap();
+    assert!(
+        end.is_none(),
+        "the server's CommandComplete ends the copy cleanly, got {end:?}"
+    );
+    drop(duplex);
+    identify(&client).await;
+    drop(client);
+    finish_script(server).await;
+}
+
+// The same through `ReplicationStream`: a shutdown is an end, not an error.
+#[tokio::test]
+async fn a_walsender_shutdown_ends_the_replication_stream_without_an_error() {
+    let (client, server) = connected(|mut s| async move {
+        s.accept().await;
+        s.start_copy_both().await;
+        s.command_complete("START_REPLICATION").await;
+        s.ready().await;
+        s.answer_query("IDENTIFY_SYSTEM").await;
+    })
+    .await;
+    let mut stream = Box::pin(ReplicationStream::new(
+        client
+            .copy_both_simple::<Bytes>(START)
+            .await
+            .expect("the copy starts"),
+    ));
+    let end = timeout(PATIENCE, stream.next()).await.unwrap();
+    assert!(end.is_none(), "a clean end, got {end:?}");
+    drop(stream);
+    identify(&client).await;
+    drop(client);
+    finish_script(server).await;
+}
+
+// The server's ErrorResponse and its ReadyForQuery arrive in separate reads while the copy runs.
+// A standby status update sent in between must not reach the wire: the server has left the copy
+// (Postgres ignores the stray CopyData, but the client must not rely on that).
+#[tokio::test]
+async fn no_copy_data_goes_out_between_a_split_error_and_ready() {
+    let (errored_tx, errored_rx) = tokio::sync::oneshot::channel::<()>();
+    let (updated_tx, updated_rx) = tokio::sync::oneshot::channel::<()>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (client, server) = connected(|mut s| async move {
+        s.accept().await;
+        s.start_copy_both().await;
+        s.error("XX000").await;
+        s.s.flush().await.unwrap();
+        errored_tx.send(()).unwrap();
+        updated_rx.await.unwrap();
+        tokio::time::sleep(SETTLE).await;
+        let mut probe = [0u8; 1];
+        let stray = timeout(SETTLE, s.s.read(&mut probe)).await;
+        assert!(
+            stray.is_err(),
+            "the client wrote after the server's error (tag {:?})",
+            probe[0] as char
+        );
+        s.ready().await;
+        ready_tx.send(()).unwrap();
+        s.answer_query("IDENTIFY_SYSTEM").await;
+    })
+    .await;
+    let mut stream = Box::pin(ReplicationStream::new(
+        client
+            .copy_both_simple::<Bytes>(START)
+            .await
+            .expect("the copy starts"),
+    ));
+    errored_rx.await.unwrap();
+    assert!(matches!(
+        timeout(PATIENCE, stream.next()).await.unwrap(),
+        Some(Err(_))
+    ));
+    let _ = timeout(
+        PATIENCE,
+        stream.as_mut().standby_status_update(
+            PgLsn::from(1),
+            PgLsn::from(1),
+            PgLsn::from(1),
+            std::time::SystemTime::now(),
+            0,
+        ),
+    )
+    .await
+    .expect("no hang");
+    updated_tx.send(()).unwrap();
+    // Held until the server has completed the command: the drop itself isn't under test.
+    if !matches!(timeout(PATIENCE, ready_rx).await, Ok(Ok(()))) {
+        // The script failed: show its panic.
+        finish_script(server).await;
+        panic!("the scripted server stopped early");
+    }
+    drop(stream);
+    identify(&client).await;
+    drop(client);
+    finish_script(server).await;
+}
+
 #[test]
 fn connection_strings_set_or_refuse_replication() {
     let config: Config = "postgresql://u@h/app?replication=database".parse().unwrap();
